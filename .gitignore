@@ -1,0 +1,8 @@
+.ssh_config.json
+__pycache__/
+*.pyc
+.idea/
+.claude/
+.venv/
+*.pdf
+tools/__pycache__/
