@@ -15,25 +15,20 @@ import os.path as op
 from openpi_client import websocket_client_policy as _wcp
 from openpi_client import image_tools
 
-PI05_HOST = "127.0.0.1"
-PI05_PORT = 8000
-
-# Gripper ellipsoid (AEGIS original)
-GRIPPER_OFFSET = np.array([0.0, 0.0, -0.08], dtype=np.float64)
-GRIPPER_Q_DIAG_DEFAULT = np.array([0.06, 0.12, 0.11], dtype=np.float64)
-GRIPPER_Q_DIAG_TALL = np.array([0.06, 0.12, 0.20], dtype=np.float64)  # for milk/juice/soup tasks
-# Obstacle ellipsoid: fitted from depth point cloud (AEGIS original), not fixed
-ALPHA_H = 10.0
-H_SAFETY_MARGIN = 0.0  # AEGIS uses 0 margin (pure h >= 0)
-CRITIC_ALPHA_BOOST = 3.0  # multiply alpha when critic predicts danger
-CRITIC_CKPT = "/root/autodl-tmp/MysafeVLA/critic_v2/critic_v2.pt"
-
-# AEGIS perception imports
-sys.path.insert(0, "/root/autodl-tmp/vlsa-aegis/main")
-from utils import (
-    compute_h_ij, compute_h_coeffs_3d, get_point_cloud,
-    filtering_points, fit_ellipse, obstacle_detection,
+# Import config (paths, parameters)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from configs import (
+    PI05_HOST, PI05_PORT, GRIPPER_OFFSET, GRIPPER_Q_DIAG_DEFAULT,
+    GRIPPER_Q_DIAG_TALL, ALPHA_H, CRITIC_ALPHA_BOOST, CRITIC_CKPT,
+    VLSA_AEGIS_ROOT, GROUNDING_DINO_CONFIG, GROUNDING_DINO_CKPT,
+    REPLAN_STEPS,
 )
+H_SAFETY_MARGIN = 0.0
+
+# AEGIS perception imports (vendored CBF math + AEGIS utils for perception)
+from safe_mole.cbf_utils import compute_h_ij, compute_h_coeffs_3d
+sys.path.insert(0, os.path.join(VLSA_AEGIS_ROOT, "main"))
+from utils import get_point_cloud, filtering_points, fit_ellipse, obstacle_detection
 
 
 def quat2axisangle(quat):
@@ -144,9 +139,6 @@ def build_openpi_element(obs, task_lang, resize_size=224):
     }
 
 
-REPLAN_STEPS = 5  # same as AEGIS
-
-
 def run(mode, level, n_eps, out_path):
     print(f"[{mode}] connecting to openpi server at {PI05_HOST}:{PI05_PORT}...", flush=True)
     client = _wcp.WebsocketClientPolicy(PI05_HOST, PI05_PORT)
@@ -157,23 +149,10 @@ def run(mode, level, n_eps, out_path):
     critic_model = None
     if mode != "baseline":
         from groundingdino.util.inference import load_model
-        model_groundingdino = load_model(
-            "/root/autodl-tmp/vlsa-aegis/GroundingDINO/GroundingDINO_SwinT_OGC.py",
-            "/root/autodl-tmp/vlsa-aegis/GroundingDINO/groundingdino_swint_ogc.pth",
-        )
+        model_groundingdino = load_model(GROUNDING_DINO_CONFIG, GROUNDING_DINO_CKPT)
         print(f"[{mode}] GroundingDINO loaded", flush=True)
     if mode == "safemole_critic":
-        class SafetyCritic(nn.Module):
-            def __init__(self, d_in=17, d_hid=128):
-                super().__init__()
-                self.net = nn.Sequential(
-                    nn.Linear(d_in, d_hid), nn.ReLU(),
-                    nn.Linear(d_hid, d_hid), nn.ReLU(),
-                    nn.Linear(d_hid, 2),
-                )
-            def forward(self, x):
-                out = self.net(x)
-                return out[:, 0], out[:, 1]
+        from safe_mole.critic import SafetyCritic
         critic_model = SafetyCritic()
         critic_model.load_state_dict(torch.load(CRITIC_CKPT, map_location="cpu"))
         critic_model.eval()

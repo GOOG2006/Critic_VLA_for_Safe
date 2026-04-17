@@ -1,0 +1,32 @@
+# Core dependencies for Critic-VLA-for-Safe
+torch>=2.0
+numpy
+scipy
+cvxpy
+open3d
+Pillow
+
+# LIBERO simulation
+robosuite
+gym>=0.25,<0.26
+
+# Perception
+groundingdino  # install from: https://github.com/IDEA-Research/GroundingDINO
+zhipuai
+zai-sdk
+
+# VLA model serving
+# openpi: install from https://github.com/Physical-Intelligence/openpi
+# lerobot: pip install lerobot (for PyTorch pi0.5 alternative)
+
+# openpi client
+openpi-client  # install from vlsa-aegis/openpi/packages/openpi-client
+
+# Misc
+tyro
+draccus
+sentencepiece
+transformers>=4.45
+safetensors
+imageio[ffmpeg]
+tqdm
