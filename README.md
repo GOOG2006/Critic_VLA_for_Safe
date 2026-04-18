@@ -8,9 +8,11 @@ This project implements a safety layer for Vision-Language-Action (VLA) models i
 
 | Method | SR (Success Rate) | CR (Collision Rate) | SS (Safe Success) |
 |--------|-------------------|--------------------|--------------------|
-| Baseline (pi0.5, no safety) | 50% | 100% | 0% |
-| AEGIS (QP-CBF only) | 50% | 25% | 50% |
-| **Ours (QP-CBF + Learned Critic)** | **100%** | 50% | **50%** |
+| Baseline (pi0.5, no safety) | 75.0% | 100% | 0% |
+| AEGIS (QP-CBF only) | 75.0% | 16.7% | 83.3% |
+| **Ours (QP-CBF + Learned Critic)** | **91.7%** | 25.0% | **75.0%** |
+
+> Full evaluation: 4 tasks × 3 episodes = 12 episodes per method, SafeLIBERO-spatial Level II.
 
 ## Method Overview
 
