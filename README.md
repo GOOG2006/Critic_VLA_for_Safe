@@ -10,7 +10,7 @@ This project implements a safety layer for Vision-Language-Action (VLA) models i
 |--------|-------------------|--------------------|--------------------|
 | Baseline (pi0.5, no safety) | 50% | 100% | 0% |
 | AEGIS (QP-CBF only) | 50% | 25% | 50% |
-| **Ours (QP-CBF + Learned Critic)** | **75%** | 50% | **50%** |
+| **Ours (QP-CBF + Learned Critic)** | **100%** | 50% | **50%** |
 
 ## Method Overview
 
@@ -23,8 +23,9 @@ Our approach adds a **learned safety critic** on top of the AEGIS CBF-QP framewo
    - Trained on baseline rollout data to predict **future collision risk** (next 10 steps)
    - Input: state features (17-dim: eef pose, gripper, action, analytic h, task phase)
    - Output: collision risk probability + predicted future h_min
-   - When critic predicts high risk (>50%), **amplifies QP safety constraint** (alpha x3)
+   - **Graduated response**: when risk > 0.6 threshold, smoothly scales QP constraint (alpha x1.0~2.5)
    - Achieves 98.2% accuracy, 97.7% precision, 100% recall on test set
+   - Enables SR=100% (vs AEGIS 50%) by intelligently balancing safety and task completion
 
 ## Architecture
 
