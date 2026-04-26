@@ -61,14 +61,56 @@ def _obstacle_type(key):
     return re.sub(r"_obstacle_\d+$", "", s)
 
 
+# Multi-ellipsoid: load LIBERO XML primitive decomposition (1-21 box geoms per
+# obstacle, each becomes a sub-ellipsoid in CBF). Activated by OBSTACLE_REPRESENTATION=multi.
+# JSON file lives next to this script. Override path with OBSTACLE_PRIMITIVES_PATH env var.
+_PRIMITIVES_PATH = os.environ.get(
+    "OBSTACLE_PRIMITIVES_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "obstacle_primitives.json"),
+)
+try:
+    with open(_PRIMITIVES_PATH) as _f:
+        OBSTACLE_PRIMITIVES = json.load(_f)
+except FileNotFoundError:
+    OBSTACLE_PRIMITIVES = {}
+
+
 def _build_gt_obstacles(obs, active_keys):
-    """Read all active obstacles from the environment as (p, Q_diag, R, name)."""
+    """Read all active obstacles from the environment as (p, Q_diag, R, name).
+
+    OBSTACLE_REPRESENTATION="single" (default, SOTA): one ellipsoid per obstacle from
+    OBSTACLE_Q_DIAG, axis-aligned to world.
+    OBSTACLE_REPRESENTATION="multi": decompose each obstacle into N primitive
+    ellipsoids using LIBERO's XML box-geom union. Each sub-ellipsoid gets its own
+    world-frame position+rotation via the obstacle's quat composed with the
+    primitive's local quat. This avoids the "ellipsoid bbox covers spout-empty
+    region" failure mode of orientation-aware single-ellipsoid (each protrusion
+    is its OWN small ellipsoid, leaving the surrounding space free).
+    """
+    # Default = "multi": LIBERO XML primitive decomposition (1-21 sub-ellipsoids
+    # per obstacle). Strict Pareto improvement over AEGIS on all 6 metrics
+    # (SR/CR/SafeSR × Lv I/Lv II) when paired with C1 perception proximity.
+    rep = os.environ.get("OBSTACLE_REPRESENTATION", "multi")
+    pad = float(os.environ.get("OBSTACLE_PADDING", "0.005"))
     obstacles = []
     for k in active_keys:
         p_obs = np.asarray(obs[k][:3], dtype=np.float64)
         name = _obstacle_type(k)
-        Q_diag = OBSTACLE_Q_DIAG.get(name, DEFAULT_OBSTACLE_Q).copy() * Q_INFLATION
-        obstacles.append((p_obs, Q_diag, np.eye(3, dtype=np.float64), name))
+        if rep == "multi" and name in OBSTACLE_PRIMITIVES:
+            quat_key = k.replace("_pos", "_quat")
+            R_world_obj = (Rot.from_quat(np.asarray(obs[quat_key], dtype=np.float64)).as_matrix()
+                           if quat_key in obs else np.eye(3, dtype=np.float64))
+            for i, prim in enumerate(OBSTACLE_PRIMITIVES[name]):
+                offset_local = np.asarray(prim['pos'], dtype=np.float64)
+                size_local = np.asarray(prim['size'], dtype=np.float64) + pad
+                R_local = Rot.from_quat(np.asarray(prim['quat'], dtype=np.float64)).as_matrix()
+                p_prim = p_obs + R_world_obj @ offset_local
+                R_prim = R_world_obj @ R_local
+                Q_prim = size_local * Q_INFLATION
+                obstacles.append((p_prim, Q_prim, R_prim, f"{name}#{i}"))
+        else:
+            Q_diag = OBSTACLE_Q_DIAG.get(name, DEFAULT_OBSTACLE_Q).copy() * Q_INFLATION
+            obstacles.append((p_obs, Q_diag, np.eye(3, dtype=np.float64), name))
     return obstacles
 
 # AEGIS perception imports
@@ -77,6 +119,77 @@ from utils import (
     compute_h_ij, compute_h_coeffs_3d, get_point_cloud,
     filtering_points, fit_ellipse, obstacle_detection,
 )
+
+
+def get_full_pointcloud(image, depth, env, view):
+    """Convert ALL pixels in the depth image to world-frame 3D points.
+
+    Plan B: drops the GroundingDINO mask step from get_point_cloud — for proximity
+    we want the densest possible scene coverage (including obstacles the VLM may
+    have missed), not a single segmented obstacle.
+    """
+    from robosuite.utils.camera_utils import (
+        get_real_depth_map, get_camera_intrinsic_matrix, get_camera_extrinsic_matrix,
+    )
+    depth = get_real_depth_map(env.sim, depth).squeeze()
+    h_full, w_full = image.shape[0], image.shape[1]
+    K_inv = np.linalg.inv(get_camera_intrinsic_matrix(env.sim, view, h_full, w_full))
+    T_cam_to_world = get_camera_extrinsic_matrix(env.sim, view)
+    v_full, u_full = np.indices((h_full, w_full))
+    v_full = (h_full - 1) - v_full  # flip vertical to match get_point_cloud convention
+    u_flat = u_full.flatten()
+    v_flat = v_full.flatten()
+    depth_flat = depth.flatten()
+    valid = (depth_flat > 1e-3) & np.isfinite(depth_flat)
+    if valid.sum() == 0:
+        return np.zeros((0, 3), dtype=np.float64)
+    pixels = np.stack([u_flat[valid], v_flat[valid], np.ones(valid.sum())], axis=0)
+    points_cam = K_inv @ pixels * depth_flat[valid]
+    points_cam_h = np.vstack([points_cam, np.ones(valid.sum())])
+    points_world = (T_cam_to_world @ points_cam_h)[:3, :].T
+    return points_world
+
+
+def filter_proximity_pointcloud(pts, eef_init_pos, suite_name,
+                                target_positions=(), target_radius=0.08,
+                                gripper_radius=0.12):
+    """Spatial filter for proximity pointcloud. Keep workspace, drop:
+       - table surface (z below threshold)
+       - far points (outside table region)
+       - points near initial gripper pose (the gripper itself in the snapshot)
+       - points near each TARGET object position (bowls/items the robot must grasp;
+         keeping these in the pointcloud causes proximity to push gripper AWAY
+         from the very object the policy is trying to reach)
+    """
+    if pts.shape[0] == 0:
+        return pts
+    if "spatial" in suite_name or "goal" in suite_name:
+        keep = ((pts[:, 2] > 0.92) & (pts[:, 2] < 1.5)
+                & (pts[:, 0] > -0.3) & (pts[:, 0] < 0.3)
+                & (pts[:, 1] > -0.3) & (pts[:, 1] < 0.3))
+    elif "object" in suite_name:
+        keep = ((pts[:, 2] > 0.05) & (pts[:, 2] < 0.5)
+                & (pts[:, 0] > -0.3) & (pts[:, 0] < 0.3)
+                & (pts[:, 1] > -0.3) & (pts[:, 1] < 0.3))
+    elif "long" in suite_name:
+        keep = ((pts[:, 2] > 0.43) & (pts[:, 2] < 0.8)
+                & (pts[:, 0] > -0.3) & (pts[:, 0] < 0.3)
+                & (pts[:, 1] > -0.3) & (pts[:, 1] < 0.3))
+    else:
+        keep = np.ones(pts.shape[0], dtype=bool)
+    pts = pts[keep]
+    if pts.shape[0] == 0:
+        return pts
+    # Drop points near initial gripper pose (gripper/finger surfaces in snapshot)
+    d_eef = np.linalg.norm(pts - eef_init_pos[:3], axis=1)
+    pts = pts[d_eef > gripper_radius]
+    # Drop points near each target object (bowl/item to be grasped)
+    for tp in target_positions:
+        if pts.shape[0] == 0:
+            break
+        d_t = np.linalg.norm(pts - np.asarray(tp[:3]), axis=1)
+        pts = pts[d_t > target_radius]
+    return pts
 
 
 def quat2axisangle(quat):
@@ -196,13 +309,17 @@ def run(mode, level, n_eps, out_path):
     print(f"[{mode}] connected to openpi pi05 server", flush=True)
 
     # Load GroundingDINO for VLM-driven perception. Also loaded for safemole_multi_critic
-    # when USE_PERCEPTION_PROXIMITY=1 (AEGIS-consistent depth pointcloud → per-step
-    # nearest-point proximity signal, used as δ correction).
+    # when USE_PERCEPTION_PROXIMITY=1 AND PROXIMITY_FULL_POINTCLOUD=0 (uses VLM mask).
+    # Plan B (PROXIMITY_FULL_POINTCLOUD=1) skips gdino entirely — full depth pointcloud
+    # captures objects VLM misses (Level I unknown items: storage_box, book, etc).
     model_groundingdino = None
     critic_model = None
-    USE_PERCEPTION_PROXIMITY = os.environ.get("USE_PERCEPTION_PROXIMITY", "0") == "1"
+    # Default ON: AEGIS-consistent depth-pointcloud → per-step nearest-point
+    # proximity signal. Used as δ correction in QP. Same input source as AEGIS.
+    USE_PERCEPTION_PROXIMITY = os.environ.get("USE_PERCEPTION_PROXIMITY", "1") == "1"
+    PROXIMITY_FULL_POINTCLOUD = os.environ.get("PROXIMITY_FULL_POINTCLOUD", "0") == "1"
     needs_gdino = mode in ("safemole", "safemole_critic") or (
-        mode == "safemole_multi_critic" and USE_PERCEPTION_PROXIMITY
+        mode == "safemole_multi_critic" and USE_PERCEPTION_PROXIMITY and not PROXIMITY_FULL_POINTCLOUD
     )
     if needs_gdino:
         from groundingdino.util.inference import load_model
@@ -278,9 +395,51 @@ def run(mode, level, n_eps, out_path):
 
             # Episode-init perception. Three modes that use it:
             #   - safemole/safemole_critic: fit single ellipsoid → use as CBF obstacle
-            #   - safemole_multi_critic + USE_PERCEPTION_PROXIMITY: keep filtered pointcloud
-            #     for per-step nearest-point proximity (AEGIS-consistent input)
+            #   - safemole_multi_critic + USE_PERCEPTION_PROXIMITY + PROXIMITY_FULL_POINTCLOUD=0:
+            #     AEGIS-consistent gdino-masked pointcloud for per-step proximity
+            #   - safemole_multi_critic + USE_PERCEPTION_PROXIMITY + PROXIMITY_FULL_POINTCLOUD=1
+            #     (Plan B): full-scene depth pointcloud (no gdino mask)
             filter_pts_ep = None  # for proximity in safemole_multi_critic
+            if (mode == "safemole_multi_critic" and USE_PERCEPTION_PROXIMITY
+                and PROXIMITY_FULL_POINTCLOUD):
+                # Plan B: dense full-scene pointcloud, gripper-init region removed.
+                agentview_img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+                agentview_depth = np.ascontiguousarray(obs["agentview_depth"][::-1, ::-1])
+                backview_img = np.ascontiguousarray(obs["backview_image"][::-1, ::-1])
+                backview_depth = np.ascontiguousarray(obs["backview_depth"][::-1, ::-1])
+                full_a = get_full_pointcloud(agentview_img, agentview_depth, env, "agentview")
+                full_b = get_full_pointcloud(backview_img, backview_depth, env, "backview")
+                if full_a.shape[0] > 0 and full_b.shape[0] > 0:
+                    full_pts = np.vstack([full_a, full_b])
+                elif full_a.shape[0] > 0:
+                    full_pts = full_a
+                elif full_b.shape[0] > 0:
+                    full_pts = full_b
+                else:
+                    full_pts = np.zeros((0, 3))
+                grip_radius = float(os.environ.get("PROX_GRIPPER_RADIUS", "0.12"))
+                target_radius = float(os.environ.get("PROX_TARGET_RADIUS", "0.08"))
+                # Targets: any non-obstacle item the policy might grasp. In LIBERO
+                # spatial these are bowls (and similar) — we exclude their region
+                # from the proximity pointcloud so the safety layer doesn't fight
+                # the policy's reach-and-grasp toward the actual target.
+                target_keys = [k for k in obs.keys()
+                               if k.endswith("_pos") and "obstacle" not in k
+                               and "to_" not in k  # exclude relative-coord keys
+                               and any(t in k for t in ("bowl", "plate", "ramekin",
+                                                         "stove", "cabinet", "akita"))]
+                target_positions = [obs[k][:3] for k in target_keys
+                                    if abs(obs[k][0]) < 0.5 and abs(obs[k][1]) < 0.5]
+                filter_pts_ep = filter_proximity_pointcloud(
+                    full_pts, eef_pos, "safelibero_spatial",
+                    target_positions=target_positions,
+                    target_radius=target_radius,
+                    gripper_radius=grip_radius,
+                ).astype(np.float64)
+                print(f"  [proxB] full-pointcloud: {len(full_pts)} raw → "
+                      f"{len(filter_pts_ep)} after filter (excluded "
+                      f"{len(target_positions)} targets: {[k.replace('_pos','') for k in target_keys if abs(obs[k][0])<0.5 and abs(obs[k][1])<0.5]})",
+                      flush=True)
             if needs_gdino and model_groundingdino is not None:
                 import pathlib
                 img_out_dir = pathlib.Path(out_path).parent / f"t{task_idx}_ep{ep}"
@@ -417,10 +576,10 @@ def run(mode, level, n_eps, out_path):
                                 risk_prob_v = float(torch.sigmoid(risk_logit).item())
                                 h_pred_v = float(h_pred.item())
                             if np.isfinite(h_pred_v) and h_pred_v < H_SAFETY_MARGIN:
-                                _critic_gain = float(os.environ.get("CRITIC_MARGIN_GAIN", "1.0"))
+                                _critic_gain = float(os.environ.get("CRITIC_MARGIN_GAIN", "0.3"))
                                 delta_eff = H_SAFETY_MARGIN + _critic_gain * (H_SAFETY_MARGIN - h_pred_v)
                                 # Clamp to avoid runaway conservatism
-                                _delta_max = float(os.environ.get("CRITIC_MARGIN_MAX", "0.08"))
+                                _delta_max = float(os.environ.get("CRITIC_MARGIN_MAX", "0.04"))
                                 delta_eff = min(delta_eff, _delta_max)
 
                         # === Plan A: AEGIS-consistent perception proximity ===

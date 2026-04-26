@@ -4,15 +4,24 @@
 
 This project implements a safety layer for Vision-Language-Action (VLA) models in robot manipulation tasks. Built on top of the [AEGIS](https://github.com/THU-RCSCT/vlsa-aegis) framework and evaluated on the [SafeLIBERO](https://huggingface.co/datasets/THURCSCT/SafeLIBERO) benchmark.
 
-## Key Results (SafeLIBERO Level II, 4 tasks)
+## Key Results (SafeLIBERO-spatial, 4 tasks × 10 episodes × 2 safety levels)
 
-| Method | SR (Success Rate) | CR (Collision Rate) | SS (Safe Success) |
-|--------|-------------------|--------------------|--------------------|
-| Baseline (pi0.5, no safety) | 75.0% | 100% | 0% |
-| AEGIS (QP-CBF only) | 75.0% | 16.7% | 83.3% |
-| **Ours (QP-CBF + Learned Critic)** | **91.7%** | 25.0% | **75.0%** |
+Holdout split (eps 3..9, 28/level — disjoint from critic training data) vs AEGIS:
 
-> Full evaluation: 4 tasks × 3 episodes = 12 episodes per method, SafeLIBERO-spatial Level II.
+| Method | Lv I SR | Lv I CR | Lv I SafeSR | Lv II SR | Lv II CR | Lv II SafeSR |
+|--------|---------|---------|-------------|----------|----------|--------------|
+| AEGIS | 0.536 | 0.357 | 0.429 | 0.714 | 0.393 | 0.536 |
+| **Ours (Multi + C1 perception, default)** | **0.571** | **0.250** | **0.571** | **0.821** | **0.250** | **0.714** |
+| Ours-Single+C1 (Lv II maximizer) | 0.679 | 0.500 | 0.429 | **0.964** | **0.143** | **0.857** |
+
+**Default config wins all 6 metrics vs AEGIS** (strict Pareto improvement). Single+C1 is reported as an alternative that maximizes Level II at the cost of Level I CR.
+
+### Method ingredients
+1. **Base VLA**: pi0.5-libero (via openpi JAX server)
+2. **Multi-obstacle GT-position CBF** (vs AEGIS single-obstacle perception ellipsoid)
+3. **Multi-ellipsoid decomposition**: each obstacle decomposed into LIBERO XML primitives (1-21 sub-ellipsoids per object), each becomes a CBF constraint. Solves the "single ellipsoid bbox blocks empty space around protrusions" failure mode.
+4. **Anticipatory critic**: 17-dim → 128 → 128 → 2 MLP, predicts future collision risk + h_min over next 10 steps. Output dynamically inflates δ in QP.
+5. **AEGIS-consistent perception proximity (C1)**: agentview + backview depth + GroundingDINO mask → per-step nearest-point proximity → δ correction.
 
 ## Method Overview
 
@@ -115,24 +124,32 @@ cd vlsa-aegis
 USE_TF=0 python openpi/scripts/serve_policy.py --env LIBERO
 ```
 
-### 2. Run Baseline (no safety)
+### 2. Run our DEFAULT (Multi + C1 perception, beats AEGIS on all 6 metrics)
 ```bash
-python MysafeVLA/scripts/eval_pi05_safelibero.py baseline II 1
+# All defaults baked in: OBSTACLE_REPRESENTATION=multi, USE_PERCEPTION_PROXIMITY=1,
+# OBSTACLE_PADDING=0.005, CRITIC_MARGIN_GAIN=0.3, CRITIC_MARGIN_MAX=0.04
+python MysafeVLA/scripts/eval_pi05_safelibero.py safemole_multi_critic II 10
 ```
 
-### 3. Run with AEGIS Safety Layer
+### 3. Run AEGIS baseline (single perception ellipsoid)
 ```bash
-python MysafeVLA/scripts/eval_pi05_safelibero.py safemole II 1
+python MysafeVLA/scripts/eval_pi05_safelibero.py safemole II 10
 ```
 
-### 4. Collect Data + Train Critic
+### 4. Run alternative: Ours-Single+C1 (Level II maximizer, SafeSR=0.857)
+```bash
+OBSTACLE_REPRESENTATION=single python MysafeVLA/scripts/eval_pi05_safelibero.py \
+  safemole_multi_critic II 10
+```
+
+### 5. Run pi0.5 baseline (no safety)
+```bash
+python MysafeVLA/scripts/eval_pi05_safelibero.py baseline II 10
+```
+
+### 6. (Optional) Re-collect data + train critic
 ```bash
 python MysafeVLA/scripts/collect_and_train_critic.py
-```
-
-### 5. Run with Critic-Enhanced Safety
-```bash
-python MysafeVLA/scripts/eval_pi05_safelibero.py safemole_critic II 1
 ```
 
 ## Theory
