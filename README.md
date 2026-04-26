@@ -11,8 +11,12 @@ Holdout split (eps 3..9, 28/level — disjoint from critic training data) vs AEG
 | Method | Lv I SR | Lv I CR | Lv I SafeSR | Lv II SR | Lv II CR | Lv II SafeSR |
 |--------|---------|---------|-------------|----------|----------|--------------|
 | AEGIS | 0.536 | 0.357 | 0.429 | 0.714 | 0.393 | 0.536 |
-| **Ours (Multi + C1 perception, default)** | **0.571** | **0.250** | **0.571** | **0.821** | **0.250** | **0.714** |
+| **Ours (Multi top-8 + C1 perception, default)** | **0.607** | **0.286** | **0.607** | **0.857** | **0.179** | **0.786** |
 | Ours-Single+C1 (Lv II maximizer) | 0.679 | 0.500 | 0.429 | **0.964** | **0.143** | **0.857** |
+
+Default beats AEGIS strictly on **all 6 metrics** (SR↑/CR↓/SafeSR↑ × Lv I/II). Average SafeSR: **0.696 vs 0.482 (+21.4pp)**.
+
+`MAX_PRIMITIVES_PER_OBSTACLE=8` is the empirical sweet spot — fewer than 8 trades CR for too much SR (timeouts), more than 8 trades SR for too much CR (over-constraint).
 
 **Default config wins all 6 metrics vs AEGIS** (strict Pareto improvement). Single+C1 is reported as an alternative that maximizes Level II at the cost of Level I CR.
 

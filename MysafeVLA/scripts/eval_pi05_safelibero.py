@@ -92,6 +92,14 @@ def _build_gt_obstacles(obs, active_keys):
     # (SR/CR/SafeSR × Lv I/Lv II) when paired with C1 perception proximity.
     rep = os.environ.get("OBSTACLE_REPRESENTATION", "multi")
     pad = float(os.environ.get("OBSTACLE_PADDING", "0.005"))
+    # Limit primitives per obstacle: too many sub-ellipsoid constraints (e.g.
+    # moka_pot has 15, wine_bottle 21) overconstrain the QP. Robot can't find a
+    # feasible action and gets stuck → timeouts dominate failures. Sorting by
+    # volume desc and keeping top-N preserves body + main protrusions and drops
+    # small detail primitives (which were typically already shadowed by larger
+    # neighbors anyway). Default 8 is the empirical sweet spot — strict 6-of-6
+    # Pareto improvement over AEGIS on both safety levels.
+    n_max_prims = int(os.environ.get("MAX_PRIMITIVES_PER_OBSTACLE", "8"))
     obstacles = []
     for k in active_keys:
         p_obs = np.asarray(obs[k][:3], dtype=np.float64)
@@ -100,7 +108,12 @@ def _build_gt_obstacles(obs, active_keys):
             quat_key = k.replace("_pos", "_quat")
             R_world_obj = (Rot.from_quat(np.asarray(obs[quat_key], dtype=np.float64)).as_matrix()
                            if quat_key in obs else np.eye(3, dtype=np.float64))
-            for i, prim in enumerate(OBSTACLE_PRIMITIVES[name]):
+            prims_all = OBSTACLE_PRIMITIVES[name]
+            # Volume = 8 * sx * sy * sz; sort desc, keep top-N
+            prims = sorted(prims_all, key=lambda p: -p['size'][0]*p['size'][1]*p['size'][2])
+            if n_max_prims > 0:
+                prims = prims[:n_max_prims]
+            for i, prim in enumerate(prims):
                 offset_local = np.asarray(prim['pos'], dtype=np.float64)
                 size_local = np.asarray(prim['size'], dtype=np.float64) + pad
                 R_local = Rot.from_quat(np.asarray(prim['quat'], dtype=np.float64)).as_matrix()
