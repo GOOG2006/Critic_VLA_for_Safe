@@ -15,20 +15,68 @@ import os.path as op
 from openpi_client import websocket_client_policy as _wcp
 from openpi_client import image_tools
 
-# Import config (paths, parameters)
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from configs import (
-    PI05_HOST, PI05_PORT, GRIPPER_OFFSET, GRIPPER_Q_DIAG_DEFAULT,
-    GRIPPER_Q_DIAG_TALL, ALPHA_H, CRITIC_ALPHA_BOOST, CRITIC_CKPT,
-    VLSA_AEGIS_ROOT, GROUNDING_DINO_CONFIG, GROUNDING_DINO_CKPT,
-    REPLAN_STEPS,
-)
-H_SAFETY_MARGIN = 0.0
+PI05_HOST = "127.0.0.1"
+PI05_PORT = 8000
 
-# AEGIS perception imports (vendored CBF math + AEGIS utils for perception)
-from safe_mole.cbf_utils import compute_h_ij, compute_h_coeffs_3d
-sys.path.insert(0, os.path.join(VLSA_AEGIS_ROOT, "main"))
-from utils import get_point_cloud, filtering_points, fit_ellipse, obstacle_detection
+# Gripper ellipsoid (AEGIS original)
+GRIPPER_OFFSET = np.array([0.0, 0.0, -0.08], dtype=np.float64)
+GRIPPER_Q_DIAG_DEFAULT = np.array([0.06, 0.12, 0.11], dtype=np.float64)
+GRIPPER_Q_DIAG_TALL = np.array([0.06, 0.12, 0.20], dtype=np.float64)  # for milk/juice/soup tasks
+# Obstacle ellipsoid: fitted from depth point cloud (AEGIS original), not fixed
+ALPHA_H = float(os.environ.get("ALPHA_H", "10.0"))
+H_SAFETY_MARGIN = float(os.environ.get("H_SAFETY_MARGIN", "0.015"))  # positive buffer on h >= δ
+Q_INFLATION = float(os.environ.get("Q_INFLATION", "1.10"))            # inflate obstacle ellipsoid
+# Multiplicative scale on the gripper ellipsoid semi-axes. Motivation: k=3 lookahead
+# evidence (h_min=0.025>δ STILL collided) shows the analytic gripper ellipsoid
+# under-approximates the real gripper-mesh + finger sweep. 1.0 = AEGIS original.
+GRIPPER_INFLATION = float(os.environ.get("GRIPPER_INFLATION", "1.0"))
+CRITIC_ALPHA_BOOST = 3.0  # multiply alpha when critic predicts danger
+CRITIC_CKPT = os.environ.get("CRITIC_CKPT", "/root/autodl-tmp/MysafeVLA/critic_v2/critic_v2.pt")
+
+# Default per-object ellipsoid sizes (semi-axes, meters). Used by `safemole_multi`
+# mode which reads all active obstacle positions from the env and stacks one
+# CBF constraint per obstacle. Values are rough over-approximations of LIBERO
+# object meshes — Q_INFLATION adds an extra safety buffer on top.
+DEFAULT_OBSTACLE_Q = np.array([0.06, 0.06, 0.12], dtype=np.float64)
+OBSTACLE_Q_DIAG = {
+    "moka_pot":         np.array([0.07,  0.07,  0.13],  dtype=np.float64),
+    "milk":             np.array([0.045, 0.045, 0.11],  dtype=np.float64),
+    "wine_bottle":      np.array([0.045, 0.045, 0.16],  dtype=np.float64),
+    "orange_juice":     np.array([0.045, 0.045, 0.13],  dtype=np.float64),
+    "alphabet_soup":    np.array([0.045, 0.045, 0.11],  dtype=np.float64),
+    "tomato_sauce":     np.array([0.045, 0.045, 0.11],  dtype=np.float64),
+    "ketchup":          np.array([0.04,  0.04,  0.12],  dtype=np.float64),
+    "salad_dressing":   np.array([0.045, 0.045, 0.13],  dtype=np.float64),
+    "cookies":          np.array([0.08,  0.06,  0.05],  dtype=np.float64),
+    "butter":           np.array([0.05,  0.05,  0.04],  dtype=np.float64),
+    "cream_cheese":     np.array([0.05,  0.05,  0.05],  dtype=np.float64),
+    "chocolate_pudding":np.array([0.05,  0.05,  0.06],  dtype=np.float64),
+}
+
+
+def _obstacle_type(key):
+    """'moka_pot_obstacle_1_pos' -> 'moka_pot'."""
+    import re
+    s = key[:-len("_pos")] if key.endswith("_pos") else key
+    return re.sub(r"_obstacle_\d+$", "", s)
+
+
+def _build_gt_obstacles(obs, active_keys):
+    """Read all active obstacles from the environment as (p, Q_diag, R, name)."""
+    obstacles = []
+    for k in active_keys:
+        p_obs = np.asarray(obs[k][:3], dtype=np.float64)
+        name = _obstacle_type(k)
+        Q_diag = OBSTACLE_Q_DIAG.get(name, DEFAULT_OBSTACLE_Q).copy() * Q_INFLATION
+        obstacles.append((p_obs, Q_diag, np.eye(3, dtype=np.float64), name))
+    return obstacles
+
+# AEGIS perception imports
+sys.path.insert(0, "/root/autodl-tmp/vlsa-aegis/main")
+from utils import (
+    compute_h_ij, compute_h_coeffs_3d, get_point_cloud,
+    filtering_points, fit_ellipse, obstacle_detection,
+)
 
 
 def quat2axisangle(quat):
@@ -139,20 +187,45 @@ def build_openpi_element(obs, task_lang, resize_size=224):
     }
 
 
+REPLAN_STEPS = 5  # same as AEGIS
+
+
 def run(mode, level, n_eps, out_path):
     print(f"[{mode}] connecting to openpi server at {PI05_HOST}:{PI05_PORT}...", flush=True)
     client = _wcp.WebsocketClientPolicy(PI05_HOST, PI05_PORT)
     print(f"[{mode}] connected to openpi pi05 server", flush=True)
 
-    # Load GroundingDINO for perception (same as AEGIS)
+    # Load GroundingDINO for VLM-driven perception. Also loaded for safemole_multi_critic
+    # when USE_PERCEPTION_PROXIMITY=1 (AEGIS-consistent depth pointcloud → per-step
+    # nearest-point proximity signal, used as δ correction).
     model_groundingdino = None
     critic_model = None
-    if mode != "baseline":
+    USE_PERCEPTION_PROXIMITY = os.environ.get("USE_PERCEPTION_PROXIMITY", "0") == "1"
+    needs_gdino = mode in ("safemole", "safemole_critic") or (
+        mode == "safemole_multi_critic" and USE_PERCEPTION_PROXIMITY
+    )
+    if needs_gdino:
         from groundingdino.util.inference import load_model
-        model_groundingdino = load_model(GROUNDING_DINO_CONFIG, GROUNDING_DINO_CKPT)
+        model_groundingdino = load_model(
+            "/root/autodl-tmp/vlsa-aegis/GroundingDINO/GroundingDINO_SwinT_OGC.py",
+            "/root/autodl-tmp/vlsa-aegis/GroundingDINO/groundingdino_swint_ogc.pth",
+        )
         print(f"[{mode}] GroundingDINO loaded", flush=True)
-    if mode == "safemole_critic":
-        from safe_mole.critic import SafetyCritic
+    elif mode in ("safemole_multi", "safemole_multi_critic"):
+        print(f"[{mode}] using GT obstacles; margin δ={H_SAFETY_MARGIN:.3f} "
+              f"Q_infl={Q_INFLATION:.2f} α={ALPHA_H}", flush=True)
+    if mode in ("safemole_critic", "safemole_multi_critic"):
+        class SafetyCritic(nn.Module):
+            def __init__(self, d_in=17, d_hid=128):
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Linear(d_in, d_hid), nn.ReLU(),
+                    nn.Linear(d_hid, d_hid), nn.ReLU(),
+                    nn.Linear(d_hid, 2),
+                )
+            def forward(self, x):
+                out = self.net(x)
+                return out[:, 0], out[:, 1]
         critic_model = SafetyCritic()
         critic_model.load_state_dict(torch.load(CRITIC_CKPT, map_location="cpu"))
         critic_model.eval()
@@ -191,6 +264,8 @@ def run(mode, level, n_eps, out_path):
 
             success, collided = False, False
             n_proj = 0; h_min_trace = 10.0
+            n_qp_infeasible = 0  # count steps where CBF-QP fell back to reference action
+            n_slack = 0          # count steps with any slack > 1e-4 (soft-constraint violated)
             action_plan = deque()
 
             # AEGIS perception: detect obstacle + fit ellipsoid (once per episode)
@@ -201,7 +276,12 @@ def run(mode, level, n_eps, out_path):
             R1 = Rot.from_quat(eef_quat).as_matrix()
             p1 = np.asarray(eef_pos[:3], dtype=np.float64) + R1 @ GRIPPER_OFFSET
 
-            if mode != "baseline" and model_groundingdino is not None:
+            # Episode-init perception. Three modes that use it:
+            #   - safemole/safemole_critic: fit single ellipsoid → use as CBF obstacle
+            #   - safemole_multi_critic + USE_PERCEPTION_PROXIMITY: keep filtered pointcloud
+            #     for per-step nearest-point proximity (AEGIS-consistent input)
+            filter_pts_ep = None  # for proximity in safemole_multi_critic
+            if needs_gdino and model_groundingdino is not None:
                 import pathlib
                 img_out_dir = pathlib.Path(out_path).parent / f"t{task_idx}_ep{ep}"
                 img_out_dir.mkdir(parents=True, exist_ok=True)
@@ -223,14 +303,24 @@ def run(mode, level, n_eps, out_path):
                     full_pts = np.array([[]])
                 filter_pts = filtering_points(full_pts, "safelibero_spatial")
                 if filter_pts.shape[0] > 0:
-                    p2, R2, Q2_diag = fit_ellipse(filter_pts, plot=True, save_path=img_out_dir)
-                    z_fixed = (p2 - p1)
-                    z_fixed = z_fixed / max(np.linalg.norm(z_fixed), 1e-6)
-                    flag_safety_control = True
-                    print(f"  Ellipsoid fitted: p2={p2.round(3)}, Q2={Q2_diag.round(3)}", flush=True)
+                    if mode in ("safemole", "safemole_critic"):
+                        p2, R2, Q2_diag = fit_ellipse(filter_pts, plot=True, save_path=img_out_dir)
+                        z_fixed = (p2 - p1)
+                        z_fixed = z_fixed / max(np.linalg.norm(z_fixed), 1e-6)
+                        flag_safety_control = True
+                        print(f"  Ellipsoid fitted: p2={p2.round(3)}, Q2={Q2_diag.round(3)}", flush=True)
+                    if mode == "safemole_multi_critic" and USE_PERCEPTION_PROXIMITY:
+                        filter_pts_ep = filter_pts.astype(np.float64)
+                        print(f"  proximity pointcloud: {len(filter_pts_ep)} points", flush=True)
 
             if not flag_safety_control:
                 z_fixed = np.array([1.0, 0.0, 0.0])
+
+            if mode == "safemole_multi":
+                _obs_init = _build_gt_obstacles(obs, active_keys)
+                print(f"  [multi] {len(_obs_init)} obstacles: "
+                      + ", ".join(f"{n}@({p[0]:.2f},{p[1]:.2f},{p[2]:.2f})"
+                                  for (p, _, _, n) in _obs_init), flush=True)
 
             for step in range(220):
                 # Action chunking (same as AEGIS): replan every REPLAN_STEPS
@@ -242,13 +332,175 @@ def run(mode, level, n_eps, out_path):
 
                 if mode == "baseline":
                     a_exec = a_nom
+                elif mode in ("safemole_multi", "safemole_multi_critic"):
+                    # === Multi-obstacle CBF-QP with GT positions + δ margin + Q inflation ===
+                    eef_pos = obs["robot0_eef_pos"]
+                    eef_quat = obs["robot0_eef_quat"]
+                    R1 = Rot.from_quat(eef_quat).as_matrix()
+                    p1 = np.asarray(eef_pos[:3], dtype=np.float64) + R1 @ GRIPPER_OFFSET
+                    Q1_diag = (GRIPPER_Q_DIAG_TALL
+                               if any(w in task.language for w in ["orange juice", "milk", "alphabet soup"])
+                               else GRIPPER_Q_DIAG_DEFAULT) * GRIPPER_INFLATION
+                    obstacles = _build_gt_obstacles(obs, active_keys)
+                    if not obstacles:
+                        a_exec = a_nom
+                    else:
+                        v_ref_local = R1.T @ a_nom[:3]
+                        u_v_ref = 5 * v_ref_local
+                        omega_ref = a_nom[3:6]
+                        u_omega_ref = 5 * omega_ref
+
+                        # Predictive CBF (approach A, rolled back to OFF by default after
+                        # k=1..3 sweep showed net regression — pi05 is open-loop and fights
+                        # preemptive braking, causing timeouts without reducing collisions).
+                        # Set CBF_LOOKAHEAD_STEPS>0 to re-enable; 0 reproduces v1.
+                        _lookahead_steps = int(os.environ.get("CBF_LOOKAHEAD_STEPS", "0"))
+                        _dt_sim = float(os.environ.get("CBF_DT_SIM", "0.05"))
+                        _danger_mult = float(os.environ.get("CBF_DANGER_MULT", "3.0"))
+                        v_nom_world = np.asarray(a_nom[:3], dtype=np.float64)
+                        p1_future = p1 + v_nom_world * _dt_sim * _lookahead_steps
+
+                        # Per-obstacle CBF coeffs + barrier value (z_fixed dynamic per obstacle)
+                        # is_default flag tracks obstacles for which we have no precise size
+                        # entry in OBSTACLE_Q_DIAG — the algorithm uses a larger δ for these
+                        # constraints to compensate for our representation uncertainty.
+                        coeffs = []
+                        h_values = []         # current h (for monitoring/trace)
+                        h_future_values = []  # predicted h under nominal rollout
+                        for (p_j, Q_j, R_j, name) in obstacles:
+                            z_j = p_j - p1
+                            nz = np.linalg.norm(z_j)
+                            z_j = z_j / (nz if nz > 1e-6 else 1.0)
+                            a_v_j, a_om_j, a_uz_j, h_curr, mu_j = compute_h_coeffs_3d(
+                                p1, Q1_diag, R1, p_j, Q_j, R_j, z_j)
+                            if _lookahead_steps > 0 and h_curr < _danger_mult * H_SAFETY_MARGIN:
+                                z_fut = p_j - p1_future
+                                nzf = np.linalg.norm(z_fut)
+                                z_fut = z_fut / (nzf if nzf > 1e-6 else 1.0)
+                                h_fut = compute_h_ij(p1_future, Q1_diag, R1, p_j, Q_j, R_j, z_fut)
+                                h_j = min(h_curr, h_fut)
+                            else:
+                                h_fut = h_curr
+                                h_j = h_curr
+                            is_default = name not in OBSTACLE_Q_DIAG
+                            coeffs.append((a_v_j, a_om_j, a_uz_j, h_j, mu_j, is_default))
+                            h_values.append(h_curr)
+                            h_future_values.append(h_fut)
+                        # Steer u_z using mu_row of the most-active obstacle (min h)
+                        min_idx = int(np.argmin(h_values))
+                        mu_row_ref = coeffs[min_idx][4]
+                        u_z_ref = 10 * mu_row_ref
+
+                        # === Plan B: critic-driven dynamic margin ===
+                        # The critic's h_pred is its estimate of the minimum h that will be
+                        # observed over the next LOOKAHEAD env steps under the CURRENT policy
+                        # distribution. It is a closed-loop learned estimator and therefore
+                        # captures (a) action-chunking decoherence, (b) Taylor-error
+                        # in the one-step CBF gradient, and (c) env integration overshoot.
+                        # We use it to inflate δ: δ_eff = δ + max(0, δ - h_pred), so whenever
+                        # the critic anticipates h dropping below δ, the QP tightens
+                        # proportionally. If h_pred ≥ δ, δ_eff = δ (no extra conservatism).
+                        delta_eff = H_SAFETY_MARGIN
+                        risk_prob_v = None; h_pred_v = None
+                        if mode == "safemole_multi_critic" and critic_model is not None:
+                            grip = obs["robot0_gripper_qpos"]
+                            bowl_pos = obs.get("akita_black_bowl_1_pos", eef_pos)[:3]
+                            bowl_lifted = float(bowl_pos[2]) - 0.85 > 0.05
+                            h_min_curr = float(min(h_values))
+                            state_vec = np.concatenate([
+                                eef_pos[:3],
+                                quat2axisangle(np.array(eef_quat, dtype=np.float64)),
+                                grip[:2], a_nom[:7], [h_min_curr], [float(bowl_lifted)],
+                            ]).astype(np.float32)
+                            with torch.no_grad():
+                                risk_logit, h_pred = critic_model(torch.from_numpy(state_vec).unsqueeze(0))
+                                risk_prob_v = float(torch.sigmoid(risk_logit).item())
+                                h_pred_v = float(h_pred.item())
+                            if np.isfinite(h_pred_v) and h_pred_v < H_SAFETY_MARGIN:
+                                _critic_gain = float(os.environ.get("CRITIC_MARGIN_GAIN", "1.0"))
+                                delta_eff = H_SAFETY_MARGIN + _critic_gain * (H_SAFETY_MARGIN - h_pred_v)
+                                # Clamp to avoid runaway conservatism
+                                _delta_max = float(os.environ.get("CRITIC_MARGIN_MAX", "0.08"))
+                                delta_eff = min(delta_eff, _delta_max)
+
+                        # === Plan A: AEGIS-consistent perception proximity ===
+                        # Per-step nearest-point distance from gripper to filtered depth
+                        # pointcloud (built once at episode init from agentview+backview
+                        # depth + GroundingDINO mask — same input AEGIS uses, but queried
+                        # per-step instead of fitted to one ellipsoid). When the real
+                        # geometry says we're closer than PROX_THRESHOLD, inflate δ_eff
+                        # uniformly to compensate for the ellipsoid undermodel.
+                        if filter_pts_ep is not None and len(filter_pts_ep) > 0:
+                            dists = np.linalg.norm(filter_pts_ep - p1, axis=1)
+                            h_prox = float(dists.min())
+                            _prox_thr = float(os.environ.get("PROX_THRESHOLD", "0.10"))
+                            _prox_gain = float(os.environ.get("PROX_GAIN", "1.0"))
+                            prox_bonus = max(0.0, _prox_thr - h_prox) * _prox_gain
+                            if prox_bonus > 0.0:
+                                _delta_max_prox = float(os.environ.get("PROX_DELTA_MAX", "0.10"))
+                                delta_eff = min(delta_eff + prox_bonus, _delta_max_prox)
+
+                        alpha_effective = ALPHA_H
+                        u = cp.Variable(9)
+                        slack = cp.Variable(len(obstacles), nonneg=True)
+                        W = np.diag([1./25]*6 + [1.]*3)
+                        u_ref_vec = np.hstack([u_v_ref, u_omega_ref, u_z_ref])
+                        # Penalty: 1e4 * L1(slack) + 1e6 * L2(slack). L1 term forces slack=0
+                        # whenever feasible; L2 term regularizes magnitudes when infeasible.
+                        slack_penalty = float(os.environ.get("SLACK_PENALTY", "1e6"))
+                        cost = cp.quad_form(u - u_ref_vec, W) \
+                            + 1e4 * cp.sum(slack) + slack_penalty * cp.sum_squares(slack)
+                        # Uncertainty-aware per-constraint δ: when the obstacle's name is not
+                        # in OBSTACLE_Q_DIAG (DEFAULT fallback), our ellipsoid is a generic
+                        # under-approximation of the true mesh. H_SAFETY_MARGIN_DEFAULT_BONUS
+                        # adds an extra buffer on those constraints only — pure algorithmic
+                        # response to representation uncertainty, no per-object data tuning.
+                        _default_bonus = float(os.environ.get("H_SAFETY_MARGIN_DEFAULT_BONUS", "0.0"))
+                        constraints = []
+                        for i, (a_v_j, a_om_j, a_uz_j, h_j, _, is_default) in enumerate(coeffs):
+                            delta_local = delta_eff + (_default_bonus if is_default else 0.0)
+                            constraints.append(
+                                0.2 * a_v_j @ u[:3] + 0.2 * a_om_j @ u[3:6] + a_uz_j @ u[6:]
+                                + alpha_effective * (h_j - delta_local) + slack[i] >= 0
+                            )
+                        prob = cp.Problem(cp.Minimize(cost), constraints)
+                        qp_ok = False; slack_val = 0.0
+                        try:
+                            prob.solve(solver=cp.OSQP, verbose=False)
+                            if u.value is not None and prob.status in ("optimal", "optimal_inaccurate"):
+                                u_v = u.value[:3]; u_omega = u.value[3:6]; u_z = u.value[6:]
+                                qp_ok = True
+                                slack_val = float(np.sum(slack.value)) if slack.value is not None else 0.0
+                            else:
+                                u_v = v_ref_local; u_omega = omega_ref; u_z = u_z_ref
+                                if n_qp_infeasible == 0:
+                                    print(f"  QP INFEASIBLE step {step}: status={prob.status} "
+                                          f"h_min={min(h_values):.4f} n_obs={len(obstacles)}", flush=True)
+                        except Exception as e:
+                            u_v = v_ref_local; u_omega = omega_ref; u_z = u_z_ref
+                            if n_qp_infeasible == 0:
+                                print(f"  QP SOLVER ERROR step {step}: {type(e).__name__}: {e}", flush=True)
+                        if not qp_ok:
+                            n_qp_infeasible += 1
+                        if slack_val > 1e-4:
+                            if n_slack == 0:
+                                print(f"  SLACK ACTIVE step {step}: sum={slack_val:.4f} "
+                                      f"h_min={min(h_values):.4f}", flush=True)
+                            n_slack += 1
+                        a_exec = np.zeros(7)
+                        a_exec[:3] = 0.2 * R1 @ u_v
+                        a_exec[3:6] = 0.2 * u_omega
+                        a_exec[6] = a_nom[6]
+                        h_min_trace = min(h_min_trace, min(h_values))
+                        if np.linalg.norm(a_exec[:3] - a_nom[:3]) > 1e-4:
+                            n_proj += 1
                 elif mode in ("safemole", "safemole_critic"):
                     # === AEGIS-faithful safety layer + optional critic ===
                     eef_pos = obs["robot0_eef_pos"]
                     eef_quat = obs["robot0_eef_quat"]
                     R1 = Rot.from_quat(eef_quat).as_matrix()
                     p1 = np.asarray(eef_pos[:3], dtype=np.float64) + R1 @ GRIPPER_OFFSET
-                    Q1_diag = GRIPPER_Q_DIAG_TALL if any(w in task.language for w in ["orange juice", "milk", "alphabet soup"]) else GRIPPER_Q_DIAG_DEFAULT
+                    Q1_diag = (GRIPPER_Q_DIAG_TALL if any(w in task.language for w in ["orange juice", "milk", "alphabet soup"]) else GRIPPER_Q_DIAG_DEFAULT) * GRIPPER_INFLATION
                     if flag_safety_control:
                         v_ref = R1.T @ a_nom[:3]
                         u_v_ref = 5 * v_ref
@@ -256,9 +508,8 @@ def run(mode, level, n_eps, out_path):
                         u_omega_ref = 5 * omega_ref
                         a_v, a_omega, a_uz, h, mu_row = compute_h_coeffs_3d(p1, Q1_diag, R1, p2, Q2_diag, R2, z_fixed)
 
-                        # Critic: predict future collision risk → graduated constraint tightening
+                        # Critic: predict future collision risk → boost constraint
                         alpha_effective = ALPHA_H
-                        h_margin = 0.0
                         if critic_model is not None:
                             grip = obs["robot0_gripper_qpos"]
                             bowl_pos = obs.get("akita_black_bowl_1_pos", eef_pos)[:3]
@@ -271,13 +522,8 @@ def run(mode, level, n_eps, out_path):
                             with torch.no_grad():
                                 risk_logit, h_pred = critic_model(torch.from_numpy(state_vec).unsqueeze(0))
                                 risk_prob = torch.sigmoid(risk_logit).item()
-                                h_pred_val = h_pred.item()
-                            # Graduated response: scale alpha smoothly with risk probability
-                            RISK_THRESHOLD = 0.6
-                            if risk_prob > RISK_THRESHOLD:
-                                t = (risk_prob - RISK_THRESHOLD) / (1.0 - RISK_THRESHOLD)
-                                boost = 1.0 + 1.5 * t  # max boost = 2.5x
-                                alpha_effective = ALPHA_H * boost
+                            if risk_prob > 0.5:
+                                alpha_effective = ALPHA_H * CRITIC_ALPHA_BOOST  # tighter constraint
 
                         a_u_v = 0.2 * a_v
                         a_u_omega = 0.2 * a_omega
@@ -286,16 +532,25 @@ def run(mode, level, n_eps, out_path):
                         W = np.diag([1./25]*6 + [1.]*3)
                         u_ref_vec = np.hstack([u_v_ref, u_omega_ref, u_z_nom])
                         objective = cp.Minimize(cp.quad_form(u - u_ref_vec, W))
-                        constraints = [a_u_v @ u[:3] + a_u_omega @ u[3:6] + a_uz @ u[6:] + alpha_effective * (h - h_margin) >= 0]
+                        constraints = [a_u_v @ u[:3] + a_u_omega @ u[3:6] + a_uz @ u[6:] + alpha_effective * h >= 0]
                         prob = cp.Problem(objective, constraints)
+                        qp_ok = False
                         try:
                             prob.solve(solver=cp.OSQP, verbose=False)
-                            if u.value is not None:
+                            if u.value is not None and prob.status in ("optimal", "optimal_inaccurate"):
                                 u_v = u.value[:3]; u_omega = u.value[3:6]; u_z = u.value[6:]
+                                qp_ok = True
                             else:
                                 u_v = v_ref; u_omega = omega_ref; u_z = u_z_nom
-                        except Exception:
+                                if n_qp_infeasible == 0:
+                                    print(f"  QP INFEASIBLE at step {step}: status={prob.status} h={h:.4f} "
+                                          f"alpha={alpha_effective:.2f} - barrier NOT enforced", flush=True)
+                        except Exception as e:
                             u_v = v_ref; u_omega = omega_ref; u_z = u_z_nom
+                            if n_qp_infeasible == 0:
+                                print(f"  QP SOLVER ERROR at step {step}: {type(e).__name__}: {e}", flush=True)
+                        if not qp_ok:
+                            n_qp_infeasible += 1
                         dz = (np.eye(3) - np.outer(z_fixed, z_fixed)) @ u_z
                         z_fixed = z_fixed + dz * 0.05
                         z_fixed = z_fixed / max(np.linalg.norm(z_fixed), 1e-6)
@@ -319,10 +574,13 @@ def run(mode, level, n_eps, out_path):
                     success = True
                     break
 
-            print(f"  ep{ep}: success={success} steps={step+1} collided={collided} proj={n_proj} h_min={h_min_trace:.3f}", flush=True)
+            print(f"  ep{ep}: success={success} steps={step+1} collided={collided} "
+                  f"proj={n_proj} qp_infeas={n_qp_infeasible} slack={n_slack} "
+                  f"h_min={h_min_trace:.3f}", flush=True)
             results.append({
                 "task_idx": task_idx, "ep": ep, "success": success, "collided": collided,
-                "steps": step+1, "n_proj": n_proj, "h_min": h_min_trace,
+                "steps": step+1, "n_proj": n_proj, "n_qp_infeasible": n_qp_infeasible,
+                "n_slack": n_slack, "h_min": h_min_trace,
             })
         try: env.close()
         except: pass
@@ -330,16 +588,32 @@ def run(mode, level, n_eps, out_path):
     n = len(results)
     sr = sum(r["success"] for r in results)
     cr = sum(r["collided"] for r in results)
+    qp_inf_total = sum(r.get("n_qp_infeasible", 0) for r in results)
+    qp_inf_eps = sum(1 for r in results if r.get("n_qp_infeasible", 0) > 0)
+    slack_total = sum(r.get("n_slack", 0) for r in results)
+    slack_eps = sum(1 for r in results if r.get("n_slack", 0) > 0)
+    safe_success = sum(1 for r in results if r["success"] and not r["collided"])
     print(f"\n=== {mode} on SafeLIBERO-spatial Level {level} ===")
-    print(f"N={n}  SR = {sr}/{n} = {sr/max(1,n):.3f}  CR = {cr}/{n} = {cr/max(1,n):.3f}")
+    print(f"N={n}  SR = {sr}/{n} = {sr/max(1,n):.3f}  CR = {cr}/{n} = {cr/max(1,n):.3f}  "
+          f"SafeSR = {safe_success}/{n} = {safe_success/max(1,n):.3f}")
+    print(f"QP infeasible: {qp_inf_total} steps across {qp_inf_eps}/{n} episodes "
+          f"(barrier not enforced for those steps)")
+    print(f"Slack active:  {slack_total} steps across {slack_eps}/{n} episodes "
+          f"(soft-constraint violated; only meaningful for safemole_multi)")
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     json.dump({"results": results, "level": level, "mode": mode}, open(out_path, "w"), indent=2)
     print(f"saved {out_path}")
 
 
 if __name__ == "__main__":
-    mode = sys.argv[1]  # baseline | safemole
+    mode = sys.argv[1]  # baseline | safemole | safemole_critic
     level = sys.argv[2] if len(sys.argv) > 2 else "II"
     n_eps = int(sys.argv[3]) if len(sys.argv) > 3 else 1
-    out = f"/root/autodl-tmp/MysafeVLA/eval_results/pi05_{mode}_lv{level}/results.json"
+    _default_root = (
+        os.environ.get("EVAL_RESULTS_DIR")
+        or (os.path.join(os.environ["MYSAFEVLA_ROOT"], "eval_results")
+            if os.environ.get("MYSAFEVLA_ROOT") else None)
+        or "/root/autodl-tmp/MysafeVLA/eval_results"
+    )
+    out = os.path.join(_default_root, f"pi05_{mode}_lv{level}", "results.json")
     run(mode, level, n_eps, out)

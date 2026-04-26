@@ -3,8 +3,14 @@
 Vendored from vlsa-aegis/main/utils.py (AEGIS project).
 Pure numpy + cvxpy, no external simulation dependencies.
 """
+import os
+import warnings
 import numpy as np
 import cvxpy as cp
+
+# Emit a warning whenever the QP falls back to the reference action.
+# Set CBF_QP_WARN=0 to silence (useful for large sweeps).
+_CBF_QP_WARN = os.environ.get("CBF_QP_WARN", "1") not in ("0", "false", "False")
 
 
 def vector_hat(v):
@@ -106,6 +112,10 @@ def solve_cbf_qp(v_ref, omega_ref, uz_ref, p1, Q1, R1, p2, Q2, R2, z_fixed, alph
     Returns:
         u_v, u_omega, u_z: optimized variables
         h: barrier value
+        status: one of "ok", "infeasible", "solver_error:<msg>". When status != "ok",
+                the returned u_v/u_omega/u_z are the *reference* action — i.e. the CBF
+                filter did NOT actually enforce the barrier constraint, and the caller
+                must record this.
     """
     a_v, a_omega, a_uz, h, mu_row = compute_h_coeffs_3d(p1, Q1, R1, p2, Q2, R2, z_fixed)
 
@@ -120,8 +130,18 @@ def solve_cbf_qp(v_ref, omega_ref, uz_ref, p1, Q1, R1, p2, Q2, R2, z_fixed, alph
     prob = cp.Problem(cp.Minimize(cost), constraints)
     try:
         prob.solve(solver=cp.OSQP, verbose=False)
-        if u.value is not None:
-            return u.value[:3], u.value[3:6], u.value[6:], h
-    except Exception:
-        pass
-    return v_ref, omega_ref, uz_ref, h
+    except Exception as e:
+        if _CBF_QP_WARN:
+            warnings.warn(f"[cbf_qp] solver error h={h:.4f}: {e}; falling back to u_ref", stacklevel=2)
+        return v_ref, omega_ref, uz_ref, h, f"solver_error:{type(e).__name__}"
+
+    if u.value is None or prob.status not in ("optimal", "optimal_inaccurate"):
+        if _CBF_QP_WARN:
+            warnings.warn(
+                f"[cbf_qp] infeasible/no-solution (status={prob.status}, h={h:.4f}); "
+                f"falling back to u_ref — barrier NOT enforced",
+                stacklevel=2,
+            )
+        return v_ref, omega_ref, uz_ref, h, "infeasible"
+
+    return u.value[:3], u.value[3:6], u.value[6:], h, "ok"
