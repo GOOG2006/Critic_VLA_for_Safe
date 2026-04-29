@@ -39,6 +39,20 @@ safe_mole_release/
 
 **vs AEGIS**: Pareto-wins on goal lvI/II, object lvI, long lvII; ties on object lvII; mixed on long lvI.
 
+## 复现命令 / Reproduction
+
+| Suite × Level | 最佳数字 (SR/CR/SafeSR) | 命令 | 备注 |
+|---|---|---|---|
+| spatial lvI | 62 / 25 / 60 | 改 `critic_v4_g010.sh` 第 18 行 → `run safelibero_spatial I` | 复用 `critic_v4_g010.sh` 配置即可 |
+| spatial lvII | 92 / 22 / 78 | 改成 `run safelibero_spatial II` | 同上 |
+| goal lvI (multi) | 82 / 8 / 75 | `bash scripts/critic_v4_g010.sh`(默认就跑 goal I+II + object I+II) | 直接跑 |
+| **goal lvI (single) ⭐** | **88 / 5 / 85** | `bash scripts/aegisperc_v2.sh` | 该 suite 的 SOTA(AEGIS-perc + 我们 critic) |
+| goal lvII | 92 / 25 / 75 | `bash scripts/paper_runs.sh`(取 `g050_lvII` 子结果) | gain=0.5 是最佳点 |
+| object lvI | 62 / 8 / 62 | `bash scripts/alpha50_object_full.sh` | α=50 + multi |
+| object lvII | 80 / 25 / 68 | `bash scripts/alpha50_object_full.sh` | 同上 |
+| long lvI | 50 / 44 / 31 | `bash scripts/long_BEST.sh I 10` | critic_v5_long, 40 ep, MAX=500 |
+| long lvII | 38 / 20 / 35 | `bash scripts/long_BEST_max800.sh II 10` | MAX=800 是关键 |
+
 ## Quickstart
 
 Server: SeetaCloud GPU host (Evo1 conda env). Requires running OpenPI policy server on `127.0.0.1:8000`.
